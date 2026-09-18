@@ -22,19 +22,28 @@ local Astryn = require(script.Parent.Astryn)
 --==================================================================
 
 Astryn:SetKeySystem({
-	Enabled = false,
+	Enabled = false, -- flip to true to gate the demo behind a real key check
 	Title = "Astryn HUB",
 	Subtitle = "Enter your key to continue",
 	Placeholder = "Astryn Key",
-	Note = "Keys are issued per session.",
+	Note = "Free keys last 24 hours. Premium is lifetime.",
 	SaveKey = true,
-	GetKeyLink = "https://example.com/astryn/key",
 
-	-- Replaceable provider. May yield. Returns (ok, message).
-	-- With no provider the gate fails closed — nothing is hardcoded.
-	Verify = function(key)
-		return false, "No key backend connected yet."
-	end,
+	-- Real backend wiring — these are also the built-in defaults, shown
+	-- explicitly here so it's obvious where to point a different
+	-- deployment. No secret, token, or credential lives here or
+	-- anywhere else in this file; the backend owns all of that.
+	ApiBaseUrl = "https://astryn-hub.vercel.app/api",
+	ValidateEndpoint = "/key/validate",
+	GetKeyUrl = "https://astryn-hub.vercel.app/get-key",
+	PremiumUrl = "https://astryn-hub.vercel.app/premium",
+
+	-- No Validate/Verify function is supplied here on purpose: leaving
+	-- both unset means Astryn HUB's built-in HTTP client talks to
+	-- ApiBaseUrl/ValidateEndpoint directly. Supplying a Validate or
+	-- Verify function (as earlier Astryn HUB versions did) would fully
+	-- override this and route through custom logic instead — still
+	-- supported for backward compatibility, just not used here.
 })
 
 --==================================================================
@@ -288,6 +297,50 @@ Misc:CreateButton({
 	Callback = function()
 		Astryn:ShowLoading({ Title = "ASTRYN HUB", Subtitle = "Recalibrating...", Duration = 2 })
 	end,
+})
+
+Misc:CreateDivider()
+Misc:CreateSection("Key System")
+
+Misc:CreateButton({
+	Name = "Validate a Test Key",
+	Description = "Calls the real backend — expect an invalid_key response for a fake key",
+	Callback = function()
+		local ok, info, message = Astryn.KeySystem:Validate("ASTRYN-TEST0-TEST0")
+		print("[Demo] KeySystem:Validate ->", ok, message)
+		Astryn:Notify({
+			Title = "Key System",
+			Content = message,
+			Variant = ok and "Success" or "Warning",
+			Duration = 4,
+		})
+	end,
+})
+
+Misc:CreateButton({
+	Name = "Show Cached Key Info",
+	Description = "IsValid / IsPremium / GetKeyInfo — never re-validates, just reads the cache",
+	Callback = function()
+		print("[Demo] IsValid:", Astryn.KeySystem:IsValid())
+		print("[Demo] IsPremium:", Astryn.KeySystem:IsPremium())
+		local info = Astryn.KeySystem:GetKeyInfo()
+		if info then
+			print("[Demo] GetKeyInfo:", info.Type, info.Premium, info.Lifetime, info.ExpiresAt)
+			print("[Demo] FormatExpiry:", Astryn.KeySystem:FormatExpiry(info))
+		else
+			print("[Demo] GetKeyInfo: nil (no successful validation yet)")
+		end
+	end,
+})
+
+Misc:CreateButton({
+	Name = "Open Get Free Key",
+	Callback = function() Astryn.KeySystem:OpenGetKey() end,
+})
+
+Misc:CreateButton({
+	Name = "Open Get Premium",
+	Callback = function() Astryn.KeySystem:OpenPremium() end,
 })
 
 Misc:CreateDivider()

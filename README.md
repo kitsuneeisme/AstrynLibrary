@@ -212,23 +212,62 @@ loader:Close()
 ## 7. Key system
 
 Enabled and keyless modes are the same call. Keyless skips the key screen
-entirely — no verification UI is ever constructed.
+entirely — no verification UI is ever constructed. By default, Astryn HUB's
+KeySystem talks to the real Astryn HUB backend over HTTP — it never creates
+a key, never trusts a local clock for expiry, and never stores a provider
+secret, API token, or signing secret.
 
 ```lua
 -- Keyless
 Astryn:SetKeySystem({ Enabled = false })
 
--- Gated
+-- Gated, using the built-in backend (this is also the default config —
+-- shown explicitly here so it's obvious where to point a different
+-- deployment)
 Astryn:SetKeySystem({
     Enabled = true,
     Title = "Astryn HUB",
     Subtitle = "Enter your key to continue",
     Placeholder = "Astryn Key",
     SaveKey = true,
-    GetKeyLink = "https://example.com/key",
 
-    -- Replaceable provider. May yield. Returns (ok, message).
-    -- `Verify` is accepted as an alias for `Validate`.
+    ApiBaseUrl = "https://astryn-hub.vercel.app/api",
+    ValidateEndpoint = "/key/validate",     -- POST {key} -> validation result
+    GetKeyUrl = "https://astryn-hub.vercel.app/get-key",
+    PremiumUrl = "https://astryn-hub.vercel.app/premium",
+})
+```
+
+The validate endpoint's request/response contract:
+
+```
+POST {ApiBaseUrl}{ValidateEndpoint}
+Body: { "key": "ASTRYN-XXXX-XXXX" }
+
+200 OK (free, active):
+{ "valid": true, "type": "FREE", "premium": false, "lifetime": false,
+  "key": "ASTRYN-XXXX-XXXX", "expiresAt": "2026-09-14T12:00:00Z" }
+
+200 OK (premium):
+{ "valid": true, "type": "PREMIUM", "premium": true, "lifetime": true,
+  "key": "ASTRYN-PREMIUM-XXXX", "expiresAt": null }
+
+200 OK (expired / invalid):
+{ "valid": false, "reason": "expired" }
+{ "valid": false, "reason": "invalid_key" }
+```
+
+Every field is type-checked before use; a malformed response is treated as
+`"Response API tidak valid."`, never as an implicit valid key.
+
+### Backward compatibility: custom validators still work
+
+Supplying `Validate` (or its alias `Verify`) as a function fully overrides
+the built-in backend call, exactly like earlier Astryn HUB versions:
+
+```lua
+Astryn:SetKeySystem({
+    Enabled = true,
     Validate = function(key)
         local ok, body = pcall(game.HttpGet, game, API .. "/verify?key=" .. key)
         return ok and body == "valid", ok and "Welcome back." or "Gateway unreachable."
@@ -236,10 +275,32 @@ Astryn:SetKeySystem({
 })
 ```
 
-With no `Validate` the gate fails closed and reports
-`"No key validator configured"`. No key is hardcoded anywhere in the library.
-Saved keys are retried silently on load and cleared automatically if rejected;
-`Astryn:ClearSavedKey()` removes one manually.
+With neither `Validate` nor `Verify` supplied, the default HTTP client is
+used. With no backend reachable and no custom validator, the gate fails
+closed — no key is ever accepted by falling through to a default "true".
+
+### Public API
+
+```lua
+Astryn.KeySystem:SetKey(key, { Validate = true })  -- saves + validates
+Astryn.KeySystem:GetKey()                          -- locally saved key, or nil
+Astryn.KeySystem:ClearKey()                        -- erases saved key + cached result
+Astryn.KeySystem:Validate(key)                     -- (ok, info, message) — talks to the backend
+Astryn.KeySystem:IsValid()                         -- from the LAST server response only
+Astryn.KeySystem:IsPremium()                       -- from the LAST server response only
+Astryn.KeySystem:GetKeyInfo()                      -- copy of the last server response, or nil
+Astryn.KeySystem:OpenGetKey()                      -- opens/copies the Get Free Key URL
+Astryn.KeySystem:OpenPremium()                     -- opens/copies the Get Premium URL
+Astryn.KeySystem:FormatExpiry(info)                -- display only: "Expires in 23h 58m" / "Lifetime"
+```
+
+`IsValid()`/`IsPremium()`/`GetKeyInfo()` never consult a local clock or the
+saved-key file — they only reflect the most recent real answer from
+`Validate()`. A saved key is a convenience for not retyping it; it is always
+re-checked against the backend at startup before being trusted, and is only
+auto-cleared when the backend gives a definitive negative (not on a network
+hiccup, which could just be a temporary outage). `Astryn:ClearSavedKey()`
+removes a saved key manually.
 
 ---
 

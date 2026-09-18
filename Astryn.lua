@@ -1733,10 +1733,39 @@ Astryn.Loading = Loading
 --==================================================================
 -- SYSTEMS / KEY SYSTEM
 --
--- Fully modular: the framework NEVER decides whether a key is valid.
--- Supply a Validate function returning (ok:boolean, message:string?).
--- It may yield (HTTP request, remote check, etc.) — it runs inside a
--- coroutine while the UI shows a verifying state.
+-- Client-side key system for Astryn HUB's website/backend. This
+-- module NEVER creates a key, NEVER decides a key is valid on its
+-- own, and NEVER stores a provider secret, API token, or signing
+-- secret. Every trust decision comes from a single HTTP call to the
+-- Astryn HUB backend:
+--
+--     POST {ApiBaseUrl}{ValidateEndpoint}     e.g. POST https://astryn-hub.vercel.app/api/key/validate
+--     Body: { "key": "ASTRYN-XXXX-XXXX" }
+--
+-- The backend is the source of truth for whether a key is valid, what
+-- type it is (FREE/PREMIUM), and when it expires. This library only:
+--   - shows the KeySystem UI
+--   - opens the website (Get Free Key / Get Premium)
+--   - accepts key input
+--   - sends the key to the validate endpoint
+--   - reads the response
+--   - reflects that response in the UI
+--   - grants access to the rest of Astryn HUB only when the backend
+--     says the key is valid
+--
+-- A locally saved key is a CONVENIENCE ONLY — it is always re-checked
+-- against the backend before being trusted; it is never treated as
+-- valid purely because it exists on disk. expiresAt is read only to
+-- format a display string; it is never compared against os.time() or
+-- any local clock to grant or deny access.
+--
+-- BACKWARD COMPATIBILITY:
+-- If a developer supplies Config.Validate (or the alias Config.Verify)
+-- as a function, that fully replaces the built-in backend call, byte
+-- for byte identical to how earlier Astryn HUB versions worked. This
+-- means existing integrations that already wired their own validator
+-- keep working unmodified. When no custom Validate/Verify function is
+-- given (the default), the library talks to the backend itself.
 --
 --   Astryn:SetKeySystem({
 --       Enabled = true,
@@ -1744,12 +1773,29 @@ Astryn.Loading = Loading
 --       Subtitle = "Enter your key to continue",
 --       Placeholder = "Astryn Key",
 --       SaveKey = true,
---       GetKeyLink = "https://example.com/key",
---       Validate = function(key) ... return true end,
+--
+--       -- Backend wiring (all optional — these are the defaults):
+--       ApiBaseUrl = "https://astryn-hub.vercel.app/api",
+--       ValidateEndpoint = "/key/validate",
+--       GetKeyUrl = "https://astryn-hub.vercel.app/get-key",
+--       PremiumUrl = "https://astryn-hub.vercel.app/premium",
 --   })
+--
+-- Public API (all under Astryn.KeySystem):
+--   SetKey(key, options)   -- saves + validates a key (options.Validate = false to skip)
+--   GetKey()               -- returns the locally saved key string, or nil
+--   ClearKey()             -- erases the saved key and the cached validation result
+--   Validate(key)          -- (ok, info, message) — the one function that talks to the backend
+--   IsValid()              -- true only if the LAST server response said valid = true
+--   IsPremium()            -- true only if the LAST server response said premium/lifetime
+--   GetKeyInfo()           -- a copy of the last server response, or nil
+--   OpenGetKey()           -- opens/copies the Get Free Key URL
+--   OpenPremium()          -- opens/copies the Get Premium URL
+--   FormatExpiry(info)     -- display-only helper: "Expires in 23h 58m" / "Lifetime" / nil
 --==================================================================
 
 local KeySystem = {}
+
 KeySystem.Config = {
 	Enabled = false,
 	Title = "Astryn HUB",
@@ -1757,12 +1803,32 @@ KeySystem.Config = {
 	Placeholder = "Astryn Key",
 	Note = "Your key unlocks the astral interface.",
 	SaveKey = true,
-	GetKeyLink = nil,
+
+	-- Backend endpoints. ApiBaseUrl is the single place the API host
+	-- lives — change this one value to point the whole KeySystem at a
+	-- different deployment. No secret ever lives alongside these.
+	ApiBaseUrl = "https://astryn-hub.vercel.app/api",
+	ValidateEndpoint = "/key/validate",
+	GetKeyUrl = "https://astryn-hub.vercel.app/get-key",
+	PremiumUrl = "https://astryn-hub.vercel.app/premium",
+
+	-- Backward-compatible: a custom validator function fully overrides
+	-- the built-in backend call. Verify is accepted as an alias.
 	Validate = nil,
+	Verify = nil,
+
+	-- Optional hooks, fired (task.spawn'd) alongside the built-in
+	-- clipboard-copy behavior of OpenGetKey/OpenPremium.
+	OnGetKey = nil,
+	OnGetPremium = nil,
 }
 
--- Accepts either Validate or Verify as the provider function name, so
--- both documented spellings work.
+-- In-memory cache of the LAST real server response. This is the only
+-- thing IsValid()/IsPremium()/GetKeyInfo() ever read — never the
+-- locally saved key file, and never a local clock comparison.
+KeySystem.LastInfo = nil
+KeySystem.LastCheckedAt = nil
+
 function KeySystem:Configure(config)
 	if type(config) ~= "table" then
 		warn("[Astryn] SetKeySystem expects a table")
@@ -1771,11 +1837,20 @@ function KeySystem:Configure(config)
 	for key, value in pairs(config) do
 		self.Config[key] = value
 	end
+	-- GetKeyLink was the old field name for GetKeyUrl. Honor it if a
+	-- caller is still using it, without discarding the new default.
+	if type(config.GetKeyLink) == "string" then
+		self.Config.GetKeyUrl = config.GetKeyLink
+	end
 	if type(config.Verify) == "function" and type(config.Validate) ~= "function" then
 		self.Config.Validate = config.Verify
 	end
 	self.Config.Enabled = self.Config.Enabled == true
 end
+
+--------------------------------------------------------------------
+-- Local storage (convenience only — never a trust source on its own)
+--------------------------------------------------------------------
 
 function KeySystem:_SavedPath()
 	return Config.Folder .. "/key.txt"
@@ -1791,28 +1866,306 @@ function KeySystem:SaveKey(key)
 	if self.Config.SaveKey then Config:Write(self:_SavedPath(), key) end
 end
 
+-- Documented aliases matching the requested public API exactly.
+function KeySystem:GetKey()
+	return self:GetSavedKey()
+end
+
 function KeySystem:ClearKey()
 	Config:Erase(self:_SavedPath())
+	self.LastInfo = nil
+	self.LastCheckedAt = nil
 end
 
--- Runs the user-supplied validator safely. With no validator the gate
--- fails closed — deliberately, so no placeholder key ever ships.
+--------------------------------------------------------------------
+-- HTTP layer
+--
+-- Tries the executor's own request function first (works even where
+-- HttpService is sandboxed for injected scripts), then falls back to
+-- Roblox's own HttpService:RequestAsync (works for real client
+-- scripts and in Studio). No domain allowlist, no secret, no token —
+-- Astryn HUB's validate endpoint is a public, unauthenticated-by-key
+-- POST that only ever accepts a key string.
+--------------------------------------------------------------------
+
+local function ExecutorRequest()
+	if typeof(syn) == "table" and typeof(syn.request) == "function" then return syn.request end
+	if typeof(http_request) == "function" then return http_request end
+	if typeof(request) == "function" then return request end
+	return nil
+end
+
+local function HttpPostJson(url, jsonBody)
+	local headers = { ["Content-Type"] = "application/json" }
+
+	local executorFn = ExecutorRequest()
+	if executorFn then
+		local ok, response = pcall(executorFn, {
+			Url = url,
+			Method = "POST",
+			Headers = headers,
+			Body = jsonBody,
+		})
+		if ok and type(response) == "table" then
+			local status = response.StatusCode or response.status_code or response.Status
+			local body = response.Body or response.body
+			if type(status) == "number" and type(body) == "string" then
+				return true, status, body
+			end
+		end
+		-- fall through to HttpService if the executor's function
+		-- returned something unusable, rather than giving up outright
+	end
+
+	local ok, result = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "POST",
+			Headers = headers,
+			Body = jsonBody,
+		})
+	end)
+	if not ok or type(result) ~= "table" then
+		return false, nil, tostring(result)
+	end
+	return true, result.StatusCode, result.Body
+end
+
+--------------------------------------------------------------------
+-- Response parsing — every field's TYPE is checked before use. A
+-- malformed, truncated, or unexpected-shape response is treated as
+-- "Response API tidak valid.", never as an implicit valid key.
+--------------------------------------------------------------------
+
+local function ParseValidateResponse(bodyText)
+	if type(bodyText) ~= "string" or #bodyText == 0 then
+		return nil
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(bodyText)
+	end)
+	if not ok or type(data) ~= "table" then
+		return nil
+	end
+	if type(data.valid) ~= "boolean" then
+		return nil
+	end
+
+	return {
+		Valid = data.valid,
+		Type = (type(data.type) == "string") and data.type or nil,
+		Premium = data.premium == true,
+		Lifetime = data.lifetime == true,
+		Key = (type(data.key) == "string") and data.key or nil,
+		-- expiresAt may legitimately be JSON null (premium/lifetime, or
+		-- an invalid-key response) — anything other than a string or
+		-- nil/false is discarded rather than trusted.
+		ExpiresAt = (type(data.expiresAt) == "string") and data.expiresAt or nil,
+		Reason = (type(data.reason) == "string") and data.reason or nil,
+	}
+end
+
+--------------------------------------------------------------------
+-- Message mapping — the exact strings requested, chosen from the
+-- server's response shape rather than guessed locally.
+--------------------------------------------------------------------
+
+function KeySystem:_SuccessMessage(info)
+	if info.Premium or info.Lifetime then
+		return "Premium aktif selamanya."
+	elseif info.Type == "FREE" then
+		return "Free Key aktif selama 24 jam."
+	end
+	return "Key berhasil divalidasi."
+end
+
+function KeySystem:_FailureMessage(info)
+	if not info then
+		return "Response API tidak valid."
+	end
+	if info.Reason == "expired" then
+		return "Key sudah expired."
+	end
+	if info.Reason == "invalid_key" then
+		return "Key tidak valid."
+	end
+	return "Key tidak valid."
+end
+
+--------------------------------------------------------------------
+-- Validate — the one function that talks to the backend.
+-- Returns: ok (boolean), info (table or nil), message (string)
+--------------------------------------------------------------------
+
 function KeySystem:Validate(key)
-	local validator = self.Config.Validate
-	if type(validator) ~= "function" then
-		return false, "No key validator configured"
+	key = tostring(key or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if #key == 0 then
+		return false, nil, "Please enter a key."
 	end
-	local ok, result, message = pcall(validator, key)
-	if not ok then
-		return false, "Validator error: " .. tostring(result)
+
+	-- Backward compatibility: a developer-supplied Validate/Verify
+	-- function fully replaces the backend call, exactly like previous
+	-- Astryn HUB versions. Its return value is normalized into the
+	-- same (ok, info, message) shape used everywhere else.
+	local custom = self.Config.Validate
+	if type(custom) == "function" then
+		local ok, result, message = pcall(custom, key)
+		if not ok then
+			return false, nil, "Validator error: " .. tostring(result)
+		end
+
+		local success, info
+		if type(result) == "table" then
+			success = (result.Success == true) or (result.Valid == true)
+			info = { Valid = success, Key = key }
+			for field, value in pairs(result) do
+				info[field] = value
+			end
+		else
+			success = result == true
+			info = success and { Valid = true, Key = key } or nil
+		end
+
+		self.LastInfo = info
+		self.LastCheckedAt = os.time()
+		return success, info, message
 	end
-	if type(result) == "table" then
-		return result.Success == true, result.Message
+
+	-- Default path: real backend validation.
+	local url = tostring(self.Config.ApiBaseUrl or "") .. tostring(self.Config.ValidateEndpoint or "")
+	local payloadOk, payload = pcall(function()
+		return HttpService:JSONEncode({ key = key })
+	end)
+	if not payloadOk then
+		return false, nil, "Response API tidak valid."
 	end
-	return result == true, message
+
+	local requestOk, status, body = HttpPostJson(url, payload)
+	if not requestOk then
+		self.LastInfo = nil
+		return false, nil, "Server Astryn HUB tidak dapat dihubungi. Silakan coba lagi."
+	end
+	if type(status) ~= "number" or status < 200 or status >= 300 then
+		self.LastInfo = nil
+		return false, nil, "Server Astryn HUB tidak dapat dihubungi. Silakan coba lagi."
+	end
+
+	local info = ParseValidateResponse(body)
+	if not info then
+		self.LastInfo = nil
+		return false, nil, "Response API tidak valid."
+	end
+	info.Key = info.Key or key
+
+	self.LastInfo = info
+	self.LastCheckedAt = os.time()
+
+	if info.Valid then
+		return true, info, self:_SuccessMessage(info)
+	end
+	return false, info, self:_FailureMessage(info)
 end
 
--- Prompt returns true/false through the supplied `onResult` callback.
+-- Documented alias: saves the key locally, then validates it against
+-- the backend (pass { Validate = false } to only save, e.g. while the
+-- user is still typing).
+function KeySystem:SetKey(key, options)
+	options = options or {}
+	key = tostring(key or "")
+	self:SaveKey(key)
+	if options.Validate == false then
+		return nil
+	end
+	return self:Validate(key)
+end
+
+--------------------------------------------------------------------
+-- Cached-result readers. These NEVER perform a network request and
+-- NEVER consult a local clock — they only reflect the last real
+-- answer the backend gave via Validate().
+--------------------------------------------------------------------
+
+function KeySystem:IsValid()
+	return self.LastInfo ~= nil and self.LastInfo.Valid == true
+end
+
+function KeySystem:IsPremium()
+	return self:IsValid() and (self.LastInfo.Premium == true or self.LastInfo.Lifetime == true)
+end
+
+function KeySystem:GetKeyInfo()
+	if not self.LastInfo then return nil end
+	local copy = {}
+	for field, value in pairs(self.LastInfo) do copy[field] = value end
+	copy.CheckedAt = self.LastCheckedAt
+	return copy
+end
+
+-- Display-only formatting. Roblox's DateTime API parses the ISO 8601
+-- string correctly as UTC (no manual timezone math, no os.time table
+-- tricks) — but the resulting string is for the UI only. It is never
+-- fed back into any validity decision; that always comes from
+-- LastInfo.Valid as set by the most recent Validate() call.
+function KeySystem:FormatExpiry(info)
+	info = info or self.LastInfo
+	if not info or not info.Valid then return nil end
+	if info.Premium or info.Lifetime then return "Lifetime" end
+	if type(info.ExpiresAt) ~= "string" then return nil end
+
+	local ok, target = pcall(DateTime.fromIsoDate, info.ExpiresAt)
+	if not ok or not target then return nil end
+
+	local remaining = target.UnixTimestamp - DateTime.now().UnixTimestamp
+	if remaining <= 0 then return "Expired" end
+
+	local hours = math.floor(remaining / 3600)
+	local minutes = math.floor((remaining % 3600) / 60)
+	return string.format("Expires in %dh %dm", hours, minutes)
+end
+
+--------------------------------------------------------------------
+-- Opening the website. There is no cross-executor "open browser" API,
+-- so — matching the convention already used for GetKeyLink in earlier
+-- Astryn HUB versions — the URL is copied to the clipboard when
+-- possible and the user is told to paste it into their browser.
+--------------------------------------------------------------------
+
+function KeySystem:OpenURL(url, label)
+	if type(url) ~= "string" or #url == 0 then
+		Notification:Notify({ Title = "Astryn HUB", Content = "No link configured.", Variant = "Warning" })
+		return false
+	end
+	if typeof(setclipboard) == "function" then
+		pcall(setclipboard, url)
+		Notification:Notify({
+			Title = "Astryn HUB",
+			Content = (label or "Link") .. " copied to clipboard. Paste it into your browser to continue.",
+			Variant = "Success",
+			Duration = 5,
+		})
+		return true
+	end
+	Notification:Notify({ Title = label or "Astryn HUB", Content = url, Duration = 8 })
+	return false
+end
+
+function KeySystem:OpenGetKey()
+	if type(self.Config.OnGetKey) == "function" then task.spawn(self.Config.OnGetKey) end
+	return self:OpenURL(self.Config.GetKeyUrl, "Get Free Key")
+end
+
+function KeySystem:OpenPremium()
+	if type(self.Config.OnGetPremium) == "function" then task.spawn(self.Config.OnGetPremium) end
+	return self:OpenURL(self.Config.PremiumUrl, "Get Premium")
+end
+
+--------------------------------------------------------------------
+-- Prompt — the modal key screen. Same Astryn visual language as the
+-- rest of the framework (Theme/Animation/Util/Background), extended
+-- with a status readout for key type, premium/lifetime, and expiry,
+-- plus a Get Free Key / Get Premium / Clear Key row.
+--------------------------------------------------------------------
+
 function KeySystem:Prompt(onResult)
 	local cfg = self.Config
 	local gui = Overlay:Get()
@@ -1839,12 +2192,14 @@ function KeySystem:Prompt(onResult)
 
 	local scale = Util.New("UIScale", { Scale = 1, Parent = blocker })
 	local viewport = Util.Viewport()
-	scale.Scale = Util.Clamp(math.min(viewport.X / 700, viewport.Y / 560), 0.62, 1.1)
+	scale.Scale = Util.Clamp(math.min(viewport.X / 720, viewport.Y / 640), 0.6, 1.1)
+
+	local CARD_WIDTH, CARD_HEIGHT = 400, 420
 
 	local card = Util.New("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromScale(0.5, 0.52),
-		Size = UDim2.fromOffset(380, 330),
+		Size = UDim2.fromOffset(CARD_WIDTH, CARD_HEIGHT),
 		BackgroundColor3 = Color3.fromRGB(11, 11, 20),
 		BackgroundTransparency = 0.04,
 		ClipsDescendants = true,
@@ -1903,8 +2258,65 @@ function KeySystem:Prompt(onResult)
 	})
 	Theme:Apply(subtitle, "TextColor3", "SubText")
 
+	-- Status pill: reflects the LAST server response only. Never shown
+	-- as "active" purely because a key exists in local storage.
+	local pill = Util.New("Frame", {
+		Position = UDim2.fromOffset(0, 92),
+		Size = UDim2.new(1, 0, 0, 46),
+		BackgroundColor3 = Color3.fromRGB(24, 24, 42),
+		ZIndex = 605,
+		Parent = content,
+	})
+	Theme:Apply(pill, "BackgroundColor3", "Tertiary")
+	Util.Corner(10, pill)
+
+	local pillType = Util.New("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = "No active key",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12.5,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Position = UDim2.fromOffset(12, 6),
+		Size = UDim2.new(1, -24, 0, 16),
+		ZIndex = 606,
+		Parent = pill,
+	})
+	Theme:Apply(pillType, "TextColor3", "SubText")
+
+	local pillExpiry = Util.New("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = "",
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Position = UDim2.fromOffset(12, 24),
+		Size = UDim2.new(1, -24, 0, 14),
+		ZIndex = 606,
+		Parent = pill,
+	})
+	Theme:Apply(pillExpiry, "TextColor3", "SubText")
+
+	local function paintPill()
+		local info = self.LastInfo
+		if not info or not info.Valid then
+			pillType.Text = "No active key"
+			pillExpiry.Text = ""
+			Theme:Apply(pillType, "TextColor3", "SubText")
+			return
+		end
+		if info.Premium or info.Lifetime then
+			pillType.Text = "★ PREMIUM"
+			pillExpiry.Text = "Lifetime access"
+			Theme:Apply(pillType, "TextColor3", "Accent")
+		else
+			pillType.Text = "FREE KEY"
+			pillExpiry.Text = self:FormatExpiry(info) or ""
+			Theme:Apply(pillType, "TextColor3", "Success")
+		end
+	end
+
 	local field = Util.New("Frame", {
-		Position = UDim2.fromOffset(0, 104),
+		Position = UDim2.fromOffset(0, 148),
 		Size = UDim2.new(1, 0, 0, 40),
 		BackgroundColor3 = Color3.fromRGB(24, 24, 42),
 		ZIndex = 605,
@@ -1946,21 +2358,21 @@ function KeySystem:Prompt(onResult)
 		Font = Enum.Font.Gotham,
 		TextSize = 11.5,
 		TextWrapped = true,
-		Position = UDim2.fromOffset(0, 150),
+		Position = UDim2.fromOffset(0, 194),
 		Size = UDim2.new(1, 0, 0, 28),
 		ZIndex = 605,
 		Parent = content,
 	})
 	Theme:Apply(status, "TextColor3", "SubText")
 
-	local function makeButton(text, y, primary, height)
+	local function makeButton(text, x, y, width, height, primary)
 		local button = Util.New("TextButton", {
 			AutoButtonColor = false,
 			Text = text,
 			Font = Enum.Font.GothamBold,
-			TextSize = 13.5,
-			Position = UDim2.fromOffset(0, y),
-			Size = UDim2.new(1, 0, 0, height or 38),
+			TextSize = 13,
+			Position = UDim2.fromOffset(x, y),
+			Size = UDim2.fromOffset(width, height),
 			BackgroundColor3 = Color3.fromRGB(31, 31, 54),
 			ZIndex = 605,
 			Parent = content,
@@ -1983,9 +2395,18 @@ function KeySystem:Prompt(onResult)
 		return button
 	end
 
-	local verify = makeButton("VERIFY KEY", 184, true)
-	local getKey = makeButton("Get Key", 230, false, 34)
-	local cancel = makeButton("Cancel", 270, false, 30)
+	local fullWidth = CARD_WIDTH - 52 -- content width after 26px side padding
+	local halfWidth = (fullWidth - 8) / 2
+
+	local verify = makeButton("VALIDATE KEY", 0, 228, fullWidth, 38, true)
+	local getFreeKey = makeButton("Get Free Key", 0, 274, halfWidth, 34, false)
+	local getPremium = makeButton("Get Premium", halfWidth + 8, 274, halfWidth, 34, false)
+	local clearKey = makeButton("Clear Key", 0, 316, halfWidth, 30, false)
+	local cancel = makeButton("Cancel", halfWidth + 8, 316, halfWidth, 30, false)
+	clearKey.Font = Enum.Font.Gotham
+	clearKey.TextSize = 12
+	clearKey.BackgroundTransparency = 1
+	Theme:Apply(clearKey, "TextColor3", "SubText")
 	cancel.Font = Enum.Font.Gotham
 	cancel.TextSize = 12
 	cancel.BackgroundTransparency = 1
@@ -2010,6 +2431,10 @@ function KeySystem:Prompt(onResult)
 		task.delay(0.2, function() if card.Parent then card.Position = base end end)
 	end
 
+	-- `silent = true` marks an automatic startup check of a saved key
+	-- (no shake animation, and the saved key is cleared only when the
+	-- backend gives a DEFINITIVE negative answer — never on a network
+	-- or parse failure, since that could just be a temporary outage).
 	local function attempt(key, silent)
 		if busy or finished then return end
 		key = tostring(key or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -2019,26 +2444,41 @@ function KeySystem:Prompt(onResult)
 			return
 		end
 		busy = true
-		verify.Text = "VERIFYING..."
-		setStatus("Contacting the astral gateway...", "SubText")
+		verify.Text = "VALIDATING..."
+		setStatus("Contacting Astryn HUB...", "SubText")
 
 		task.spawn(function()
-			local ok, message = KeySystem:Validate(key)
+			local ok, info, message = self:Validate(key)
 			busy = false
 			if finished then return end
+
+			paintPill()
+
 			if ok then
 				verify.Text = "ACCESS GRANTED"
 				verify.BackgroundColor3 = Theme:Get("Success")
-				setStatus(message or "Key accepted. Opening Astryn HUB...", "Success")
-				KeySystem:SaveKey(key)
-				Animation.Tween(card, { Size = UDim2.fromOffset(380, 330), BackgroundTransparency = 1 }, "Smooth")
+				setStatus(message, "Success")
+				self:SaveKey(key)
+				Animation.Tween(card, { Size = UDim2.fromOffset(CARD_WIDTH, CARD_HEIGHT), BackgroundTransparency = 1 }, "Smooth")
 				Animation.Tween(blocker, { BackgroundTransparency = 1 }, "Smooth")
 				finish(true)
 			else
-				verify.Text = "VERIFY KEY"
-				setStatus(message or "Invalid key. Please try again.", "Error")
-				if not silent then shake() end
-				if silent then KeySystem:ClearKey() end
+				verify.Text = "VALIDATE KEY"
+				setStatus(message, "Error")
+				if not silent then
+					shake()
+				else
+					-- A definitive answer (info ~= nil) means the backend
+					-- actually looked the key up and rejected it — e.g.
+					-- expired or invalid. A nil info means the request
+					-- itself failed (network/parse), so the saved key is
+					-- left alone; it might still be good once we're back
+					-- online.
+					if info ~= nil then
+						self:ClearKey()
+						paintPill()
+					end
+				end
 			end
 		end)
 	end
@@ -2048,21 +2488,20 @@ function KeySystem:Prompt(onResult)
 		if enter then attempt(input.Text) end
 	end))
 
-	maid:Give(getKey.MouseButton1Click:Connect(function()
-		local link = cfg.GetKeyLink
-		if cfg.OnGetKey then
-			task.spawn(cfg.OnGetKey)
-		end
-		if link then
-			if setclipboard then
-				pcall(setclipboard, link)
-				setStatus("Key link copied to clipboard.", "Success")
-			else
-				setStatus(link, "SubText")
-			end
-		else
-			setStatus("No key link configured.", "Warning")
-		end
+	maid:Give(getFreeKey.MouseButton1Click:Connect(function()
+		self:OpenGetKey()
+	end))
+
+	maid:Give(getPremium.MouseButton1Click:Connect(function()
+		self:OpenPremium()
+	end))
+
+	maid:Give(clearKey.MouseButton1Click:Connect(function()
+		self:ClearKey()
+		input.Text = ""
+		paintPill()
+		verify.Text = "VALIDATE KEY"
+		setStatus("Saved key cleared.", "SubText")
 	end))
 
 	maid:Give(cancel.MouseButton1Click:Connect(function()
@@ -2072,11 +2511,16 @@ function KeySystem:Prompt(onResult)
 	end))
 
 	-- entrance animation
-	card.Size = UDim2.fromOffset(340, 300)
+	card.Size = UDim2.fromOffset(CARD_WIDTH - 40, CARD_HEIGHT - 30)
 	card.BackgroundTransparency = 1
-	Animation.Tween(card, { Size = UDim2.fromOffset(380, 330), BackgroundTransparency = 0.04 }, "Spring")
+	Animation.Tween(card, { Size = UDim2.fromOffset(CARD_WIDTH, CARD_HEIGHT), BackgroundTransparency = 0.04 }, "Spring")
 
-	-- try a saved key silently
+	paintPill()
+
+	-- Try a saved key silently against the backend. This is the ONLY
+	-- automatic validation call this module ever makes — there is no
+	-- polling loop, no per-frame or per-second re-check anywhere in
+	-- this module.
 	local saved = self:GetSavedKey()
 	if saved then
 		input.Text = saved
@@ -4923,6 +5367,14 @@ end
 
 function Astryn:SetKeySystem(config) KeySystem:Configure(config) end
 function Astryn:ClearSavedKey() KeySystem:ClearKey() end
+
+-- Top-level convenience forwards to Astryn.KeySystem, mirroring the
+-- ClearSavedKey pattern above. Astryn.KeySystem:Method(...) remains the
+-- full, namespaced way to reach every KeySystem function documented above.
+function Astryn:GetKey() return KeySystem:GetKey() end
+function Astryn:IsKeyValid() return KeySystem:IsValid() end
+function Astryn:IsPremium() return KeySystem:IsPremium() end
+function Astryn:GetKeyInfo() return KeySystem:GetKeyInfo() end
 
 function Astryn:SaveConfig(name) return Config:Save(name) end
 function Astryn:LoadConfig(name) return Config:Load(name) end
